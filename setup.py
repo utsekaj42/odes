@@ -9,7 +9,7 @@ LICENSE: the license of odes is the same as scipy, new BSD.
 
 import os
 import sys
-
+os.environ["CC"]="gcc"
 import setuptools
 
 from common import *
