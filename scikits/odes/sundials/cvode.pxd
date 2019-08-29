@@ -2,8 +2,7 @@
 
 cimport numpy as np
 from .c_sundials cimport N_Vector, realtype
-
-ctypedef np.float_t DTYPE_t
+from .common_defs cimport DTYPE_t, INDEX_TYPE_t
 
 cdef class CV_RhsFunction:
     cpdef int evaluate(self, DTYPE_t t,
@@ -30,6 +29,7 @@ cdef class CV_WrapRootFunction(CV_RootFunction):
 cdef class CV_JacRhsFunction:
     cpdef int evaluate(self, DTYPE_t t,
                        np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] fy,
                        np.ndarray[DTYPE_t, ndim=2] J) except? -1
 
 cdef class CV_WrapJacRhsFunction(CV_JacRhsFunction):
@@ -79,6 +79,18 @@ cdef class CV_WrapJacTimesVecFunction(CV_JacTimesVecFunction):
     cdef int with_userdata
     cpdef set_jac_times_vecfn(self, object jac_times_vecfn)
 
+cdef class CV_JacTimesSetupFunction:
+    cpdef int evaluate(self,
+                       DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] fy,
+                       object userdata = *) except? -1
+
+cdef class CV_WrapJacTimesSetupFunction(CV_JacTimesSetupFunction):
+    cpdef object _jac_times_setupfn
+    cdef int with_userdata
+    cpdef set_jac_times_setupfn(self, object jac_times_setupfn)
+
 cdef class CV_ContinuationFunction:
     cpdef object _fn
     cpdef int evaluate(self, DTYPE_t t, np.ndarray[DTYPE_t, ndim=1] y,
@@ -106,6 +118,7 @@ cdef class CV_data:
     cdef CV_PrecSolveFunction prec_solvefn
     cdef CV_PrecSetupFunction prec_setupfn
     cdef CV_JacTimesVecFunction jac_times_vecfn
+    cdef CV_JacTimesSetupFunction jac_times_setupfn
     cdef bint parallel_implementation
     cdef object user_data
     cdef CV_ErrHandler err_handler
@@ -118,7 +131,7 @@ cdef class CVODE:
     cdef bint parallel_implementation, initialized, _old_api, _step_compute, _validate_flags
     cdef CV_data aux_data
 
-    cdef long int N #problem size, i.e. len(y0) = N
+    cdef INDEX_TYPE_t N #problem size, i.e. len(y0) = N
     cdef N_Vector y0, y, yp # for 'step' method
     cdef list t_roots
     cdef list y_roots
@@ -129,7 +142,7 @@ cdef class CVODE:
 
     # Functions
     cpdef _init_step(self, DTYPE_t t0, np.ndarray[DTYPE_t, ndim=1] y0)
-    cpdef _reinit_IC(self, double t0, np.ndarray[DTYPE_t, ndim=1] y0)
+    cpdef _reinit_IC(self, DTYPE_t t0, np.ndarray[DTYPE_t, ndim=1] y0)
 
     cpdef _solve(self, np.ndarray[DTYPE_t, ndim=1] tspan,
                        np.ndarray[DTYPE_t, ndim=1] y0)

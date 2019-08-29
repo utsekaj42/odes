@@ -5,6 +5,8 @@ from __future__ import print_function
 Tests for differential algebraic equation solvers.
 """
 import numpy
+import platform
+import scipy.sparse as sparse
 
 from numpy import (arange, zeros, array, dot, sqrt, cos, sin, allclose,
                     empty, alen)
@@ -12,6 +14,7 @@ from numpy import (arange, zeros, array, dot, sqrt, cos, sin, allclose,
 from numpy.testing import TestCase, run_module_suite
 from scipy.integrate import ode as Iode
 from scikits.odes import ode,dae
+from scikits.odes.sundials.common_defs import DTYPE
 
 class TestDae(TestCase):
     """
@@ -23,49 +26,100 @@ class TestDae(TestCase):
             jac = problem.jac
         res = problem.res
 
-        ig = dae(integrator, res, jacfn=jac, old_api=old_api)
-        ig.set_options(old_api=old_api, **integrator_params)
-        z = empty((1+len(problem.stop_t),alen(problem.z0)), float)
-        zprime = empty((1+len(problem.stop_t),alen(problem.z0)), float)
-        ist = ig.init_step(0., problem.z0, problem.zprime0, z[0], zprime[0])
-        i=1
-        for time in problem.stop_t:
-            soln = ig.step(time, z[i], zprime[i])
-            if old_api:
-                flag, rt = soln
-            else:
-                flag = soln.flag
-                rt = soln.values.t
-            i += 1
-            if integrator == 'ida':
-                assert flag==0, (problem.info(), flag)
-            else:
-                assert flag > 0, (problem.info(), flag)
+        class UserData:
+            def __init__(self):
+                self.J = None
 
-        assert problem.verify(array(z), array(zprime),  [0.]+problem.stop_t), \
-                    (problem.info(),)
+        my_userdata = UserData()
+
+        jac_times_vec = None
+        jac_times_vec2 = None
+        jac_times_setupfn = None
+
+        # restrict to 'ida' method since jacobian function below
+        # follows the ida interface
+        if jac is not None and integrator == 'ida':
+            def jac_times_vec(tt, yy, yp, rr, v, Jv, cj):
+                J = zeros((len(yy), len(yy)), DTYPE)
+                jac(tt, yy, yp, rr, cj, J)
+                Js = sparse.csr_matrix(J)
+                Jv[:] = Js * v
+                return 0
+
+            def jac_times_vec2(tt, yy, yp, rr, v, Jv, cj, userdata):
+                Jv[:] = userdata.J * v
+                return 0
+
+            def jac_times_setupfn(tt, yy, yp, rr, cj, userdata):
+                J = zeros((len(yy), len(yy)), DTYPE)
+                jac(tt, yy, yp, rr, cj, J)
+                userdata.J = sparse.csr_matrix(J)
+                return 0
+
+        igs = [dae(integrator, res, jacfn=jac, old_api=old_api)]
+
+        # if testing 'ida' then try the iterative linsolvers as well
+        if integrator == 'ida':
+            igs.append(
+                dae(integrator, res, linsolver='spgmr',
+                    jac_times_vecfn=jac_times_vec,
+                    old_api=old_api)
+            )
+            igs.append(
+                dae(integrator, res, linsolver='spgmr',
+                    jac_times_vecfn=jac_times_vec2,
+                    jac_times_setupfn=jac_times_setupfn,
+                    old_api=old_api,
+                    user_data=my_userdata)
+            )
+
+        for ig in igs:
+            ig.set_options(old_api=old_api, **integrator_params)
+            z = empty((1+len(problem.stop_t),alen(problem.z0)), DTYPE)
+            zprime = empty((1+len(problem.stop_t),alen(problem.z0)), DTYPE)
+            ist = ig.init_step(0., problem.z0, problem.zprime0, z[0], zprime[0])
+            i=1
+            for time in problem.stop_t:
+                soln = ig.step(time, z[i], zprime[i])
+                if old_api:
+                    flag, rt = soln
+                else:
+                    flag = soln.flag
+                    rt = soln.values.t
+                i += 1
+                if integrator == 'ida':
+                    assert flag==0, (problem.info(), flag)
+                else:
+                    assert flag > 0, (problem.info(), flag)
+
+            assert problem.verify(array(z), array(zprime),  [0.]+problem.stop_t), \
+                        (problem.info(),)
+
 
     def test_ddaspk(self):
         """Check the ddaspk solver"""
-        for problem_cls in PROBLEMS:
+        for problem_cls in PROBLEMS_DDASPK:
             problem = problem_cls()
             self._do_problem(problem, 'ddaspk', **problem.ddaspk_pars)
 
     def test_lsodi(self):
         """Check the lsodi solver"""
+        # skip on aarch64, see https://github.com/bmcage/odes/issues/101
+        if platform.machine() == "aarch64":
+            return
         for problem_cls in PROBLEMS_LSODI:
             problem = problem_cls()
             self._do_problem(problem, 'lsodi', **problem.lsodi_pars)
 
     def test_ida_old_api(self):
         """Check the ida solver"""
-        for problem_cls in PROBLEMS:
+        for problem_cls in PROBLEMS_IDA:
             problem = problem_cls()
             self._do_problem(problem, 'ida', old_api=True, **problem.ida_pars)
 
     def test_ida(self):
         """Check the ida solver"""
-        for problem_cls in PROBLEMS:
+        for problem_cls in PROBLEMS_IDA:
             problem = problem_cls()
             self._do_problem(problem, 'ida', old_api=False, **problem.ida_pars)
 
@@ -109,8 +163,8 @@ class SimpleOscillator(DAE):
 
     k = 4.0
     m = 1.0
-    z0      = array([dotu0, u0], float)
-    zprime0 = array([-k*u0/m, dotu0], float)
+    z0      = array([dotu0, u0], DTYPE)
+    zprime0 = array([-k*u0/m, dotu0], DTYPE)
 
     def __init__(self):
         self.lsodi_pars = {'adda_func' : self.adda}
@@ -120,8 +174,8 @@ class SimpleOscillator(DAE):
         return doc
 
     def res(self, t, z, zp, res):
-        tmp1 = zeros((2,2), float)
-        tmp2 = zeros((2,2), float)
+        tmp1 = zeros((2,2), DTYPE)
+        tmp2 = zeros((2,2), DTYPE)
         tmp1[0,0] = self.m
         tmp1[1,1] = 1.
         tmp2[0,1] = self.k
@@ -146,7 +200,15 @@ class SimpleOscillator(DAE):
 class SimpleOscillatorJac(SimpleOscillator):
     def jac(self, t, y, yp, cj, jac):
         """Jacobian[i,j] is dRES(i)/dY(j) + CJ*dRES(i)/dYPRIME(j)"""
-        jc = zeros((len(y), len(y)), float)
+        jc = zeros((len(y), len(y)), DTYPE)
+        cj_in = cj
+        jac[0][0] = self.m*cj_in ;jac[0][1] = self.k
+        jac[1][0] = -1       ;jac[1][1] = cj_in;
+
+class SimpleOscillatorJacIDA(SimpleOscillator):
+    def jac(self, t, y, yp, residual, cj, jac):
+        """Jacobian[i,j] is dRES(i)/dY(j) + CJ*dRES(i)/dYPRIME(j)"""
+        jc = zeros((len(y), len(y)), DTYPE)
         cj_in = cj
         jac[0][0] = self.m*cj_in ;jac[0][1] = self.k
         jac[1][0] = -1       ;jac[1][1] = cj_in;
@@ -161,8 +223,8 @@ class StiffVODECompare(DAE):
      [t = 4., y0(t) = 0.905519130228504610, y1(t) = 0.0000224343714361267687,
                y2(t) = 0.0944584354000592570]
     """
-    z0      = array([1., 0., 0.], float)
-    zprime0 = array([-0.04, 0.04, 0.], float)
+    z0      = array([1., 0., 0.], DTYPE)
+    zprime0 = array([-0.04, 0.04, 0.], DTYPE)
 
     atol    = 1e-4
     rtol    = 1e-4
@@ -182,7 +244,7 @@ class StiffVODECompare(DAE):
     def f_cvode(self, t, y, ydot):
         ydot[:] = self.f_vode(t, y)
 
-    def jac_cvode(self, t, y, J):
+    def jac_cvode(self, t, y, fy, J):
         J[:,:] = self.jac_vode(t, y)
 
     def __init__(self):
@@ -247,8 +309,10 @@ class StiffVODECompare(DAE):
         return ( allclose(self.sol, y, atol=self.atol, rtol=self.rtol) and
                  allclose(self.sol2, y, atol=self.atol, rtol=self.rtol) )
 
-PROBLEMS = [SimpleOscillator, StiffVODECompare,
+PROBLEMS_DDASPK = [SimpleOscillator, StiffVODECompare,
             SimpleOscillatorJac ]
+PROBLEMS_IDA = [SimpleOscillator, StiffVODECompare,
+            SimpleOscillatorJacIDA ]
 PROBLEMS_LSODI = [SimpleOscillator, StiffVODECompare]
 #------------------------------------------------------------------------------
 

@@ -1,22 +1,35 @@
+# cython: embedsignature=True
 from cpython.exc cimport PyErr_CheckSignals
 from collections import namedtuple
 from enum import IntEnum
 import inspect
 from warnings import warn
 
+include "sundials_config.pxi"
+
 import numpy as np
 cimport numpy as np
 
+
 from .c_sundials cimport realtype, N_Vector
+from .c_nvector_serial cimport *
+from .c_sunmatrix cimport *
+from .c_sunlinsol cimport *
+
 from .c_ida cimport *
-from .common_defs cimport (nv_s2ndarray, ndarray2nv_s, ndarray2DlsMatd)
+from .common_defs cimport (
+    nv_s2ndarray, ndarray2nv_s, ndarray2SUNMatrix, DTYPE_t, INDEX_TYPE_t,
+)
+from .common_defs import DTYPE, INDEX_TYPE
+# this is needed because we want DTYPE and INDEX_TYPE to be
+# accessible from python (not only in cython)
 from . import (
     IDASolveFailed, IDASolveFoundRoot, IDASolveReachedTSTOP, _get_num_args,
 )
 
+
 # TODO: parallel implementation: N_VectorParallel
 # TODO: linsolvers: check the output value for errors
-# TODO: unify using float/double/realtype variable
 # TODO: optimize code for compiler
 
 SolverReturn = namedtuple(
@@ -61,6 +74,8 @@ class StatusEnumIDA(IntEnum):
     BAD_T = IDA_BAD_T
     BAD_DKY = IDA_BAD_DKY
 
+    UNRECOGNISED_ERROR = IDA_UNRECOGNISED_ERROR
+
 STATUS_MESSAGE = {
     StatusEnumIDA.SUCCESS: "Successful function return.",
     StatusEnumIDA.TSTOP_RETURN: "Reached specified stopping point",
@@ -88,6 +103,7 @@ STATUS_MESSAGE = {
     StatusEnumIDA.BAD_K: "Illegal value for k. If the requested k is not in the range 0,1,...,order used ",
     StatusEnumIDA.BAD_T: "Illegal value for t. If t is not within the interval of the last step taken.",
     StatusEnumIDA.BAD_DKY: "The dky vector is NULL",
+    StatusEnumIDA.UNRECOGNISED_ERROR: "Unrecognised error",
 
 }
 
@@ -246,6 +262,7 @@ cdef class IDA_JacRhsFunction:
     cpdef int evaluate(self, DTYPE_t t,
                        np.ndarray[DTYPE_t, ndim=1] y,
                        np.ndarray[DTYPE_t, ndim=1] ydot,
+                       np.ndarray[DTYPE_t, ndim=1] residual,
                        DTYPE_t cj,
                        np.ndarray J) except? -1:
         """
@@ -270,6 +287,7 @@ cdef class IDA_WrapJacRhsFunction(IDA_JacRhsFunction):
     cpdef int evaluate(self, DTYPE_t t,
                        np.ndarray[DTYPE_t, ndim=1] y,
                        np.ndarray[DTYPE_t, ndim=1] ydot,
+                       np.ndarray[DTYPE_t, ndim=1] residual,
                        DTYPE_t cj,
                        np.ndarray J) except? -1:
         """
@@ -281,16 +299,16 @@ cdef class IDA_WrapJacRhsFunction(IDA_JacRhsFunction):
 ##            self._jacfn(t, y, ydot, cj, J, userdata)
 ##        else:
 ##            self._jacfn(t, y, ydot, cj, J)
-        user_flag = self._jacfn(t, y, ydot, cj, J)
+        user_flag = self._jacfn(t, y, ydot, residual, cj, J)
         if user_flag is None:
             user_flag = 0
         return user_flag
 
-cdef int _jacdense(long int Neq, realtype tt, realtype cj,
-            N_Vector yy, N_Vector yp, N_Vector rr, DlsMat Jac,
+cdef int _jacdense(realtype tt, realtype cj,
+            N_Vector yy, N_Vector yp, N_Vector rr, SUNMatrix Jac,
             void *auxiliary_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3):
-    """function with the signature of IDADlsDenseJacFn """
-    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, yp_tmp
+    """function with the signature of IDADlsJacFn """
+    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, yp_tmp, residual_tmp
     cdef np.ndarray jac_tmp
 
     aux_data = <IDA_data> auxiliary_data
@@ -300,22 +318,381 @@ cdef int _jacdense(long int Neq, realtype tt, realtype cj,
     else:
         yy_tmp = aux_data.yy_tmp
         yp_tmp = aux_data.yp_tmp
+        residual_tmp = aux_data.residual_tmp
         if aux_data.jac_tmp is None:
             N = np.alen(yy_tmp)
-            aux_data.jac_tmp = np.empty((N,N), float)
+            aux_data.jac_tmp = np.empty((N,N), DTYPE)
         jac_tmp = aux_data.jac_tmp
 
         nv_s2ndarray(yy, yy_tmp)
         nv_s2ndarray(yp, yp_tmp)
-    user_flag = aux_data.jac.evaluate(tt, yy_tmp, yp_tmp, cj, jac_tmp)
+        nv_s2ndarray(rr, residual_tmp)
+    user_flag = aux_data.jac.evaluate(tt, yy_tmp, yp_tmp, residual_tmp, cj, jac_tmp)
 
     if parallel_implementation:
         raise NotImplemented
     else:
-        #we convert the python jac_tmp array to DslMat of sundials
-        ndarray2DlsMatd(Jac, jac_tmp)
+        ndarray2SUNMatrix(Jac, jac_tmp)
 
     return user_flag
+
+
+# Precondioner setup funtion
+cdef class IDA_PrecSetupFunction:
+    """
+    Prototype for preconditioning setup function.
+
+    Note that evaluate must return a integer, 0 for success, positive for
+    recoverable failure, negative for unrecoverable failure (as per CVODE
+    documentation).
+    """
+    cpdef int evaluate(self, DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+        """
+        This function preprocesses and/or evaluates Jacobian-related data
+        needed by the preconditioner. Use the userdata object to expose
+        the preprocessed data to the solve function.
+
+        This is a generic class, you should subclass it for the problem specific
+        purposes.
+        """
+        return 0
+
+cdef class IDA_WrapPrecSetupFunction(IDA_PrecSetupFunction):
+    cpdef set_prec_setupfn(self, object prec_setupfn):
+        """
+        set a precondititioning setup method as a IDA_PrecSetupFunction
+        executable class
+        """
+        self.with_userdata = 0
+        nrarg = _get_num_args(prec_setupfn)
+        if nrarg > 5:
+            #hopefully a class method, self gives 6 arg!
+            self.with_userdata = 1
+        elif nrarg == 5 and inspect.isfunction(prec_setupfn):
+            self.with_userdata = 1
+        self._prec_setupfn = prec_setupfn
+
+    cpdef int evaluate(self, DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+        if self.with_userdata == 1:
+            user_flag = self._prec_setupfn(t, y, yp, rr, cj, userdata)
+        else:
+            user_flag = self._prec_setupfn(t, y, yp, rr, cj)
+        if user_flag is None:
+            user_flag = 0
+        return user_flag
+
+cdef int _prec_setupfn(realtype tt, N_Vector yy, N_Vector yp, N_Vector rr,
+                       realtype cj,
+                       void *auxiliary_data):
+    """ function with the signature of IDASpilsPrecSetupFn, that calls
+        the python function """
+    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, rp_tmp, residual_tmp
+
+    aux_data = <IDA_data> auxiliary_data
+    cdef bint parallel_implementation = aux_data.parallel_implementation
+
+    if parallel_implementation:
+        raise NotImplemented
+    else:
+        yy_tmp = aux_data.yy_tmp
+        yp_tmp = aux_data.yp_tmp
+        residual_tmp = aux_data.residual_tmp
+        nv_s2ndarray(yy, yy_tmp)
+        nv_s2ndarray(yp, yp_tmp)
+        nv_s2ndarray(rr, residual_tmp)
+
+    user_flag = aux_data.prec_setupfn.evaluate(tt, yy_tmp, yp_tmp,
+                                               residual_tmp, cj, aux_data.user_data)
+    return user_flag
+
+# Precondioner solve funtion
+cdef class IDA_PrecSolveFunction:
+    """
+    Prototype for precondititioning solution function.
+
+    Note that evaluate must return a integer, 0 for success, positive for
+    recoverable failure, negative for unrecoverable failure (as per CVODE
+    documentation).
+    """
+    cpdef int evaluate(self, DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] r,
+                       np.ndarray[DTYPE_t, ndim=1] rvec,
+                       np.ndarray[DTYPE_t, ndim=1] z,
+                       DTYPE_t cj,
+                       DTYPE_t delta,
+                       object userdata = None) except? -1:
+        """
+        This function solves the preconditioned system P*z = r, where P may be
+        either a left or right preconditioner matrix. Here P should approximate
+        (at least crudely) the Newton matrix M = I − gamma*J, where J is the
+        Jacobian of the system. If preconditioning is done on both sides,
+        the product of the two preconditioner matrices should approximate M.
+
+        This is a generic class, you should subclass it for the problem specific
+        purposes.
+        """
+        return 0
+
+cdef class IDA_WrapPrecSolveFunction(IDA_PrecSolveFunction):
+    cpdef set_prec_solvefn(self, object prec_solvefn):
+        """
+        set a precondititioning solve method as a IDA_PrecSolveFunction
+        executable class
+        """
+        self.with_userdata = 0
+        nrarg = _get_num_args(prec_solvefn)
+        if nrarg > 9:
+            #hopefully a class method, self gives 10 arg!
+            self.with_userdata = 1
+        elif nrarg == 9 and inspect.isfunction(prec_solvefn):
+            self.with_userdata = 1
+        self._prec_solvefn = prec_solvefn
+
+    cpdef int evaluate(self, DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] y,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] r,
+                       np.ndarray[DTYPE_t, ndim=1] rvec,
+                       np.ndarray[DTYPE_t, ndim=1] z,
+                       DTYPE_t cj,
+                       DTYPE_t delta,
+                       object userdata = None) except? -1:
+        if self.with_userdata == 1:
+            user_flag = self._prec_solvefn(t, y, yp, r, rvec, z, cj, delta, userdata)
+        else:
+            user_flag = self._prec_solvefn(t, y, yp, r, rvec, z, cj, delta)
+
+        if user_flag is None:
+            user_flag = 0
+        return user_flag
+
+cdef int _prec_solvefn(realtype tt, N_Vector yy, N_Vector yp, N_Vector r,
+                       N_Vector rvec, N_Vector z, realtype cj,
+                       realtype delta, void *auxiliary_data):
+    """ function with the signature of CVSpilsPrecSolveFn, that calls python function """
+    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, r_tmp, z_tmp
+
+    aux_data = <IDA_data> auxiliary_data
+    cdef bint parallel_implementation = aux_data.parallel_implementation
+
+    if parallel_implementation:
+        raise NotImplemented
+    else:
+        yy_tmp = aux_data.yy_tmp
+        yp_tmp = aux_data.yp_tmp
+        residual_tmp = aux_data.residual_tmp
+
+        if aux_data.r_vec is None:
+            N = np.alen(yy_tmp)
+            aux_data.rvec_tmp = np.empty(N, DTYPE)
+
+        if aux_data.z_tmp is None:
+            N = np.alen(yy_tmp)
+            aux_data.z_tmp = np.empty(N, DTYPE)
+
+        rvec_tmp = aux_data.rvec_tmp
+        z_tmp = aux_data.z_tmp
+
+        nv_s2ndarray(yy, yy_tmp)
+        nv_s2ndarray(yp, yp_tmp)
+        nv_s2ndarray(r, residual_tmp)
+        nv_s2ndarray(rvec, rvec_tmp)
+        nv_s2ndarray(z, z_tmp)
+
+    user_flag = aux_data.prec_solvefn.evaluate(tt, yy_tmp, residual_tmp,
+                                               rvec_tmp, z_tmp, cj, delta,
+                                               aux_data.user_data)
+
+    if parallel_implementation:
+        raise NotImplemented
+    else:
+        ndarray2nv_s(z, z_tmp)
+
+    return user_flag
+
+# JacTimesVec function
+cdef class IDA_JacTimesVecFunction:
+    """
+    Prototype for jacobian times vector function.
+
+    Note that evaluate must return a integer, 0 for success, non-zero for error
+    (as per IDA documentation).
+    """
+    cpdef int evaluate(self,
+                       DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] yy,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       np.ndarray[DTYPE_t, ndim=1] v,
+                       np.ndarray[DTYPE_t, ndim=1] Jv,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+
+        """
+        This function calculates the product of the Jacobian with a given vector v.
+        Use the userdata object to expose Jacobian related data to the solve function.
+
+        This is a generic class, you should subclass it for the problem specific
+        purposes.
+        """
+        return 0
+
+cdef class IDA_WrapJacTimesVecFunction(IDA_JacTimesVecFunction):
+    cpdef set_jac_times_vecfn(self, object jac_times_vecfn):
+        """
+        Set some IDA_JacTimesVecFn executable class.
+        """
+        """
+        set a jacobian-times-vector method as a IDA_JacTimesVecFunction
+        executable class
+        """
+        self.with_userdata = 0
+        nrarg = _get_num_args(jac_times_vecfn)
+        if nrarg > 8:
+            #hopefully a class method, self gives 9 arg!
+            self.with_userdata = 1
+        elif nrarg == 8 and inspect.isfunction(jac_times_vecfn):
+            self.with_userdata = 1
+        self._jac_times_vecfn = jac_times_vecfn
+
+    cpdef int evaluate(self,
+                       DTYPE_t t,
+                       np.ndarray[DTYPE_t, ndim=1] yy,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       np.ndarray[DTYPE_t, ndim=1] v,
+                       np.ndarray[DTYPE_t, ndim=1] Jv,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+        if self.with_userdata == 1:
+            user_flag = self._jac_times_vecfn(rr, yy, yp, rr, v, Jv, cj, userdata)
+        else:
+            user_flag = self._jac_times_vecfn(rr, yy, yp, rr, v, Jv, cj)
+        if user_flag is None:
+            user_flag = 0
+        return user_flag
+
+cdef int _jac_times_vecfn(realtype t, N_Vector yy, N_Vector yp, N_Vector rr, N_Vector v,
+        N_Vector Jv, realtype cj, void *user_data, N_Vector tmp1, N_Vector tmp2) except? -1:
+    """ function with the signature of IDA_JacTimesVecFunction, that calls python function """
+    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, yp_tmp, rr_tmp, v_tmp, Jv_tmp
+
+    aux_data = <IDA_data> user_data
+    cdef bint parallel_implementation = aux_data.parallel_implementation
+
+    if parallel_implementation:
+        raise NotImplemented
+    
+    yy_tmp = aux_data.yy_tmp
+    yp_tmp = aux_data.yp_tmp
+    rr_tmp = aux_data.residual_tmp
+    v_tmp = aux_data.v_tmp
+    Jv_tmp = aux_data.z_tmp
+
+    nv_s2ndarray(yy, yy_tmp)
+    nv_s2ndarray(yp, yp_tmp)
+    nv_s2ndarray(rr, rr_tmp)
+    nv_s2ndarray(v, v_tmp)
+
+    user_flag = aux_data.jac_times_vecfn.evaluate(t, yy_tmp, yp_tmp, rr_tmp, v_tmp,
+            Jv_tmp, cj, aux_data.user_data)
+
+    ndarray2nv_s(Jv, Jv_tmp)
+
+    return user_flag
+
+# JacTimesVec function
+cdef class IDA_JacTimesSetupFunction:
+    """
+    Prototype for jacobian times setup function.
+
+    Note that evaluate must return a integer, 0 for success, non-zero for error
+    (as per CVODE documentation), with >0  a recoverable error (step is retried).
+    """
+    cpdef int evaluate(self,
+                       DTYPE_t tt,
+                       np.ndarray[DTYPE_t, ndim=1] yy,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+        """
+        This function calculates the product of the Jacobian with a given vector v.
+        Use the userdata object to expose Jacobian related data to the solve function.
+
+        This is a generic class, you should subclass it for the problem specific
+        purposes.
+        """
+        return 0
+
+cdef class IDA_WrapJacTimesSetupFunction(IDA_JacTimesSetupFunction):
+    cpdef set_jac_times_setupfn(self, object jac_times_setupfn):
+        """
+        Set some IDA_JacTimesSetupFn executable class.
+        """
+        """
+        set a jacobian-times-vector method setup as a IDA_JacTimesSetupFunction
+        executable class
+        """
+        self.with_userdata = 0
+        nrarg = _get_num_args(jac_times_setupfn)
+        if nrarg > 6:
+            #hopefully a class method, self gives 7 arg!
+            self.with_userdata = 1
+        elif nrarg == 6 and inspect.isfunction(jac_times_setupfn):
+            self.with_userdata = 1
+        self._jac_times_setupfn = jac_times_setupfn
+
+    cpdef int evaluate(self,
+                       DTYPE_t tt,
+                       np.ndarray[DTYPE_t, ndim=1] yy,
+                       np.ndarray[DTYPE_t, ndim=1] yp,
+                       np.ndarray[DTYPE_t, ndim=1] rr,
+                       DTYPE_t cj,
+                       object userdata = None) except? -1:
+        if self.with_userdata == 1:
+            user_flag = self._jac_times_setupfn(tt, yy, yp, rr, cj, userdata)
+        else:
+            user_flag = self._jac_times_setupfn(tt, yy, yp, rr, cj)
+        if user_flag is None:
+            user_flag = 0
+        return user_flag
+
+cdef int _jac_times_setupfn(realtype tt, N_Vector yy, N_Vector yp, N_Vector rr, 
+                            realtype cj, void *user_data) except? -1:
+    """ function with the signature of IDA_JacTimesSetupFunction, that calls python function """
+    cdef np.ndarray[DTYPE_t, ndim=1] yy_tmp, yp_tmp, rr_tmp
+
+    aux_data = <IDA_data> user_data
+    cdef bint parallel_implementation = aux_data.parallel_implementation
+
+    if parallel_implementation:
+        raise NotImplemented
+
+    yy_tmp = aux_data.yy_tmp
+    yp_tmp = aux_data.yp_tmp
+    rr_tmp = aux_data.residual_tmp
+
+    nv_s2ndarray(yy, yy_tmp)
+    nv_s2ndarray(yp, yp_tmp)
+    nv_s2ndarray(rr, rr_tmp)
+
+    user_flag = aux_data.jac_times_setupfn.evaluate(tt, yy_tmp, yp_tmp, rr_tmp, cj, aux_data.user_data)
+
+    return user_flag
+
 
 cdef class IDA_ContinuationFunction:
     """
@@ -387,11 +764,15 @@ cdef class IDA_data:
         self.user_data = None
         self.err_user_data = None
 
-        self.yy_tmp = np.empty(N, float)
-        self.yp_tmp = np.empty(N, float)
-        self.residual_tmp = np.empty(N, float)
+        self.yy_tmp = np.empty(N, DTYPE)
+        self.yp_tmp = np.empty(N, DTYPE)
+        self.residual_tmp = np.empty(N, DTYPE)
         self.jac_tmp = None
         self.g_tmp = None
+        self.z_tmp = None
+        self.rvec_tmp = None
+        self.v_tmp = np.empty(N, DTYPE)
+        self.z_tmp = np.empty(N, DTYPE)
 
 cdef class IDA:
 
@@ -430,6 +811,11 @@ cdef class IDA:
             'rootfn': None,
             'nr_rootfns': 0,
             'jacfn': None,
+            'precond_type': 'NONE',
+            'prec_setupfn': None,
+            'prec_solvefn': None,
+            'jac_times_vecfn': None,
+            'jac_times_setupfn': None,
             'err_handler': None,
             'err_user_data': None,
             'old_api': None,
@@ -636,6 +1022,58 @@ cdef class IDA:
                              2.0 - variable has to be positive (i.e. > 0)
                             -1.0 - variable has to be non-positive (i.e. <= 0)
                             -2.0 - variable has to be negative (i.e. < 0)
+            'precond_type':
+                default = None
+            'prec_setupfn':
+                Values: function of class IDA_PrecSetupFunction
+                Description:
+                    Defines a function that setups the preconditioner on change
+                    of the Jacobian. This function takes as input arguments
+                    current time t, current value of y, flag jok that indicates
+                    whether Jacobian-related data has to be updated, flag jcurPtr
+                    that should be set to True (jcurPtr.value = True) if Jacobian
+                    data was recomputed, parameter gamma and optional userdata.
+            'prec_solvefn':
+                Values: function of class IDA_PrecSolveFunction
+                Description:
+                    Defines a function that solves the preconditioning problem
+                    P*z = r where P may be a left or right preconditioner
+                    matrix. This function takes as input arguments current time
+                    t, current value of y, right-hand side r, result vector z,
+                    parameters gamma and delta, input flag lr that determines
+                    the flavour of the preconditioner (left = 1, right = 2) and
+                    optional userdata.
+            'jac_times_vecfn':
+                Values: function of class IDA_JacTimesVecFunction
+                Description:
+                    Defines a function that solves the product of vector v
+                    with an (approximate) Jacobian of the system J.
+                    This function takes as input arguments:
+                        tt is the current value of the independent variable.
+                        yy is the current value of the dependent variable vector, y(t).
+                        yp is the current value of ˙y(t).
+                        rr is the current value of the residual vector F(t, y, y˙).
+                        v is the vector by which the Jacobian must be multiplied to 
+                            the right.
+                        Jv is the computed output vector.
+                        cj is the scalar in the system Jacobian, proportional to the 
+                            inverse of the step size.
+                        user data is a pointer to user data (optional)
+            'jac_times_setupfn':
+                Values: function of class IDA_JacTimesSetupFunction
+                Description:
+                    Optional. Default is to internal finite difference with no
+                    extra setup.
+                    Defines a function that preprocesses and/or evaluates 
+                    Jacobian-related data needed by the Jacobiantimes-vector routine
+                    This function takes as input arguments:
+                        tt is the current value of the independent variable.
+                        yy is the current value of the dependent variable vector, y(t).
+                        yp is the current value of ˙y(t).
+                        rr is the current value of the residual vector F(t, y, y˙).
+                        cj is the scalar in the system Jacobian, proportional to the 
+                            inverse of the step size.
+                        user data is a pointer to user data (optional)
             'err_handler':
                 Values: function of class IDA_ErrHandler, default = None
                 Description:
@@ -725,7 +1163,7 @@ cdef class IDA:
                 self.options['rootfn'] = tmpfun
 
             self.aux_data.rootfn = rootfn
-            self.aux_data.g_tmp  = np.empty([nr_rootfns,], float)
+            self.aux_data.g_tmp  = np.empty([nr_rootfns,], DTYPE)
 
             flag = IDARootInit(ida_mem, nr_rootfns, _rootfn)
 
@@ -772,7 +1210,7 @@ cdef class IDA:
                 flag = IDASStolerances(ida_mem, <realtype> opts_rtol,
                                                 <realtype> opts_atol)
             else:
-                np_atol = np.asarray(opts_atol)
+                np_atol = np.asarray(opts_atol, dtype=DTYPE)
                 if np.alen(np_atol) != self.N:
                     raise ValueError("Array length inconsistency: 'atol' "
                                      "lenght (%i) differs from problem size "
@@ -841,7 +1279,7 @@ cdef class IDA:
             self.options['validate_flags'] = validate_flags
             self._validate_flags = options["validate_flags"]
 
-    def init_step(self, double t0, object y0, object yp0,
+    def init_step(self, DTYPE_t t0, object y0, object yp0,
                    np.ndarray y_ic0_retn = None,
                    np.ndarray yp_ic0_retn = None):
         """
@@ -873,11 +1311,11 @@ cdef class IDA:
                 message= String with message in case of an error
         """
         cdef int flag
-        cdef float time
+        cdef DTYPE_t time
         cdef np.ndarray[DTYPE_t, ndim=1] np_y0
         cdef np.ndarray[DTYPE_t, ndim=1] np_yp0
-        np_y0  = np.asarray(y0, dtype=float)
-        np_yp0 = np.asarray(yp0, dtype=float)
+        np_y0  = np.asarray(y0, dtype=DTYPE)
+        np_yp0 = np.asarray(yp0, dtype=DTYPE)
 
         flag, time = self._init_step(t0, np_y0, np_yp0, y_ic0_retn, yp_ic0_retn)
 
@@ -902,8 +1340,8 @@ cdef class IDA:
             if self._old_api:
                 return (True, time)
             else:
-                y_retn  = np.empty(np.alen(np_y0), float)
-                yp_retn = np.empty(np.alen(np_y0), float)
+                y_retn  = np.empty(np.alen(np_y0), DTYPE)
+                yp_retn = np.empty(np.alen(np_y0), DTYPE)
                 # if no init cond computed, the start values are values at t=0
                 y_retn[:] = np_y0[:]
                 yp_retn[:] = np_yp0[:]
@@ -957,8 +1395,8 @@ cdef class IDA:
         self.parallel_implementation = (opts['implementation'].lower() == 'parallel')
         if self.parallel_implementation:
             raise ValueError('Error: Parallel implementation not implemented !')
-        cdef long int N
-        N = <long int> np.alen(y0)
+        cdef INDEX_TYPE_t N
+        N = <INDEX_TYPE_t> np.alen(y0)
 
         if opts['rfn'] is None:
             raise ValueError('The residual function rfn not assigned '
@@ -1064,6 +1502,38 @@ cdef class IDA:
         self.aux_data.jac = jac
         self.aux_data.user_data = opts['user_data']
 
+        prec_setupfn = opts['prec_setupfn']
+        if prec_setupfn is not None and not isinstance(prec_setupfn, IDA_PrecSetupFunction):
+            tmpfun = IDA_WrapPrecSetupFunction()
+            tmpfun.set_prec_setupfn(prec_setupfn)
+            prec_setupfn = tmpfun
+            opts['prec_setupfn'] = tmpfun
+        self.aux_data.prec_setupfn = prec_setupfn
+
+        prec_solvefn = opts['prec_solvefn']
+        if prec_solvefn is not None and not isinstance(prec_solvefn, IDA_PrecSolveFunction):
+            tmpfun = IDA_WrapPrecSolveFunction()
+            tmpfun.set_prec_solvefn(prec_solvefn)
+            prec_solvefn = tmpfun
+            opts['prec_solvefn'] = tmpfun
+        self.aux_data.prec_solvefn = prec_solvefn
+
+        jac_times_vecfn = opts['jac_times_vecfn']
+        if jac_times_vecfn is not None and not isinstance(jac_times_vecfn, IDA_JacTimesVecFunction):
+            tmpfun = IDA_WrapJacTimesVecFunction()
+            tmpfun.set_jac_times_vecfn(jac_times_vecfn)
+            jac_times_vecfn = tmpfun
+            opts['jac_times_vecfn'] = tmpfun
+        self.aux_data.jac_times_vecfn = jac_times_vecfn
+
+        jac_times_setupfn = opts['jac_times_setupfn']
+        if jac_times_setupfn is not None and not isinstance(jac_times_setupfn, IDA_JacTimesSetupFunction):
+            tmpfun = IDA_WrapJacTimesSetupFunction()
+            tmpfun.set_jac_times_setupfn(jac_times_setupfn)
+            jac_times_setupfn = tmpfun
+            opts['jac_times_setupfn'] = tmpfun
+        self.aux_data.jac_times_setupfn = jac_times_setupfn
+
         self._set_runtime_changeable_options(opts, supress_supported_check=True)
 
         if flag == IDA_ILL_INPUT:
@@ -1093,63 +1563,162 @@ cdef class IDA:
         linsolver = opts['linsolver'].lower()
 
         if linsolver == 'dense':
-            if self.parallel_implementation:
-                raise ValueError('Linear solver for dense matrices can be used '
-                                  'only for serial implementation. For parallel'
-                                  ' implementation use ''lapackdense'' instead.')
-            else:
-                 flag = IDADense(ida_mem, N)
-                 if flag == IDADLS_ILL_INPUT:
-                     raise ValueError('IDADense solver is not compatible with'
-                                      ' the current nvector implementation.')
-                 elif flag == IDADLS_MEM_FAIL:
-                     raise MemoryError('IDADense memory allocation error.')
-        elif linsolver == 'lapackdense':
-            flag = IDALapackDense(ida_mem, N)
+            A = SUNDenseMatrix(N, N)
+            LS = SUNDenseLinearSolver(self.y0, A)
+            # check if memory was allocated
+            if (A == NULL or LS == NULL):
+                raise ValueError('Could not allocate matrix or linear solver')
+            # attach matrix and linear solver to cvode
+            flag = IDADlsSetLinearSolver(ida_mem, LS, A)
             if flag == IDADLS_ILL_INPUT:
-                raise ValueError('IDALapackDense solver is not compatible with'
-                                 ' the current nvector implementation.')
-            elif flag == IDADLS_MEM_FAIL:
-                raise MemoryError('IDALapackDense memory allocation error.')
+                raise ValueError('IDADense linear solver setting failed, '
+                                'arguments incompatible')
+            elif flag == IDADLS_MEM_NULL:
+                raise MemoryError('IDADense linear solver memory allocation error.')
+            elif flag != IDADLS_SUCCESS:
+                raise ValueError('IDADlsSetLinearSolver failed with code {}'
+                                 .format(flag))
         elif linsolver == 'band':
-            if self.parallel_implementation:
-                raise ValueError('Linear solver for band matrices can be used'
-                                 'only for serial implementation. For parallel'
-                                 ' implementation use ''lapackband'' instead.')
-            else:
-                flag = IDABand(ida_mem, N, <int> opts['uband'],
-                                           <int> opts['lband'])
-                if flag == IDADLS_ILL_INPUT:
-                    raise ValueError('IDABand solver is not compatible'
-                                     ' with the current nvector implementation'
-                                     ' or bandwith outside range.')
-                elif flag == IDADLS_MEM_FAIL:
-                    raise MemoryError('IDABand memory allocation error.')
-        elif linsolver == 'lapackband':
-            flag = IDALapackBand(ida_mem, N, <int> opts['uband'],
-                                             <int> opts['lband'])
+            A = SUNBandMatrix(N, <int> opts['uband'], <int> opts['lband'],
+                                 <int> opts['uband'] + <int> opts['lband']);
+            LS = SUNBandLinearSolver(self.y0, A);
+            if (A == NULL or LS == NULL):
+                raise ValueError('Could not allocate matrix or linear solver')
+            flag = IDADlsSetLinearSolver(ida_mem, LS, A)
             if flag == IDADLS_ILL_INPUT:
-                raise ValueError('IDALapackBand solver is not compatible'
-                                 ' with the current nvector implementation'
-                                 ' or bandwith outside range.')
-            elif flag == IDADLS_MEM_FAIL:
-                raise MemoryError('IDALapackBand memory allocation error.')
+                raise ValueError('IDABand linear solver setting failed, '
+                                'arguments incompatible')
+            elif flag == IDADLS_MEM_NULL:
+                raise MemoryError('IDABand linear solver memory allocation error.')
+            elif flag != IDADLS_SUCCESS:
+                raise ValueError('IDADlsSetLinearSolver failed with code {}'
+                                 .format(flag))
         elif ((linsolver == 'spgmr') or (linsolver == 'spbcg')
                   or (linsolver == 'sptfqmr')):
             maxl = <int> opts['maxl']
 
-            if linsolver == 'spgmr':
-                flag = IDASpgmr(ida_mem, maxl)
-            elif linsolver == 'spbcg':
-                flag = IDASpbcg(ida_mem, maxl)
+            precond_type = opts['precond_type'].lower()
+            if precond_type == 'none':
+                pretype = PREC_NONE
+            elif precond_type == 'left':
+                pretype = PREC_LEFT
+            elif precond_type == 'right':
+                pretype = PREC_RIGHT
+            elif precond_type == 'both':
+                pretype = PREC_BOTH
             else:
-                flag = IDASptfqmr(ida_mem, maxl)
+                raise ValueError('LinSolver::Precondition: Unknown type: %s'
+                                 % opts['precond_type'])
 
-            if flag == IDASPILS_MEM_FAIL:
-                raise MemoryError('LinSolver:IDASpils memory allocation error.')
+
+            if linsolver == 'spgmr':
+                LS = SUNSPGMR(self.y0, pretype, maxl);
+                if LS == NULL:
+                    raise ValueError('Could not allocate linear solver')
+            elif linsolver == 'spbcgs':
+                LS = SUNSPBCGS(self.y0, pretype, maxl);
+                if LS == NULL:
+                    raise ValueError('Could not allocate linear solver')
+            elif linsolver == 'sptfqmr':
+                LS = SUNSPTFQMR(self.y0, pretype, maxl);
+                if LS == NULL:
+                    raise ValueError('Could not allocate linear solver')
+            else:
+                raise ValueError('Given linsolver {} not implemented in odes'.format(linsolver))
+
+            flag = IDASpilsSetLinearSolver(ida_mem, LS);
+            if flag == IDASPILS_MEM_NULL:
+                    raise MemoryError('IDA memory was NULL')
+            elif flag == IDASPILS_ILL_INPUT:
+                    raise MemoryError('linear solver memory was NULL')
+            elif flag != IDASPILS_SUCCESS:
+                raise ValueError('IDASpilsSetLinearSolver failed with code {}'
+                                 .format(flag))
+            # TODO: make option for the Gram-Schmidt orthogonalization
+            #flag = SUNSPGMRSetGSType(LS, gstype);
+
+            # TODO make option
+            #flag = IDASpilsSetEpsLin(cvode_mem, DELT);
+
+            if self.aux_data.prec_solvefn:
+                if self.aux_data.prec_setupfn:
+                    flag = IDASpilsSetPreconditioner(ida_mem, _prec_setupfn,
+                                                     _prec_solvefn)
+                else:
+                    flag = IDASpilsSetPreconditioner(ida_mem, NULL, _prec_solvefn)
+            if flag == IDASPILS_MEM_NULL:
+                raise ValueError('LinSolver: The cvode mem pointer is NULL.')
+            elif flag == IDASPILS_LMEM_NULL:
+                raise ValueError('LinSolver: The cvspils linear solver has '
+                                 'not been initialized.')
+            elif flag != IDASPILS_SUCCESS:
+                raise ValueError('IDASpilsSetPreconditioner failed with code {}'
+                                 .format(flag))
+
+            if self.aux_data.jac_times_vecfn:
+                if self.aux_data.jac_times_setupfn:
+                   flag = IDASpilsSetJacTimes(ida_mem, _jac_times_setupfn, _jac_times_vecfn)
+                else:
+                   flag = IDASpilsSetJacTimes(ida_mem, NULL, _jac_times_vecfn)
+            if flag == IDASPILS_MEM_NULL:
+                raise ValueError('LinSolver: The ida mem pointer is NULL.')
+            elif flag == IDASPILS_LMEM_NULL:
+                raise ValueError('LinSolver: The idaspils linear solver has '
+                                 'not been initialized.')
+            elif flag != IDASPILS_SUCCESS:
+                raise ValueError('IDASpilsSetJacTimes failed with code {}'
+                                 .format(flag))
+        else:
+            IF SUNDIALS_BLAS_LAPACK:
+                if linsolver == 'lapackdense':
+                    A = SUNDenseMatrix(N, N)
+                    LS = SUNLapackDense(self.y0, A)
+                    # check if memory was allocated
+                    if (A == NULL or LS == NULL):
+                        raise ValueError('Could not allocate matrix or linear solver')
+                    # attach matrix and linear solver to cvode
+                    flag = IDADlsSetLinearSolver(ida_mem, LS, A)
+                    if flag == IDADLS_ILL_INPUT:
+                        raise ValueError('IDADense linear solver setting failed, '
+                                        'arguments incompatible')
+                    elif flag == IDADLS_MEM_NULL:
+                        raise MemoryError('IDADense linear solver memory allocation error.')
+                    elif flag != IDADLS_SUCCESS:
+                        raise ValueError('IDADlsSetLinearSolver failed with code {}'
+                                         .format(flag))
+                elif linsolver == 'lapackband':
+                    A = SUNBandMatrix(N, <int> opts['uband'], <int> opts['lband'],
+                                         <int> opts['uband'] + <int> opts['lband']);
+                    LS = SUNLapackBand(self.y0, A)
+                    if (A == NULL or LS == NULL):
+                        raise ValueError('Could not allocate matrix or linear solver')
+                    flag = IDADlsSetLinearSolver(ida_mem, LS, A)
+                    if flag == IDADLS_ILL_INPUT:
+                        raise ValueError('IDABand linear solver setting failed, '
+                                        'arguments incompatible')
+                    elif flag == IDADLS_MEM_NULL:
+                        raise MemoryError('IDABand linear solver memory allocation error.')
+                    elif flag != IDADLS_SUCCESS:
+                        raise ValueError('IDADlsSetLinearSolver failed with code {}'
+                                         .format(flag))
+                else:
+                    raise ValueError('LinSolver: Unknown solver type: %s'
+                                         % opts['linsolver'])
+            ELSE:
+                raise ValueError('LinSolver: Unknown solver type: %s'
+                                     % opts['linsolver'])
+
 
         if (linsolver in ['dense', 'lapackdense']) and self.aux_data.jac:
-            IDADlsSetDenseJacFn(ida_mem, _jacdense)
+            self.aux_data.jac_tmp = np.empty((np.alen(y0), np.alen(y0)), DTYPE)
+            flag = IDADlsSetJacFn(ida_mem, _jacdense)
+            if flag == IDADLS_MEM_NULL:
+                raise MemoryError('IDA Memory NULL.')
+            if flag == IDADLS_LMEM_NULL:
+                raise ValueError('IDA linear solver memory NULL')
+            elif flag != IDADLS_SUCCESS:
+                raise ValueError('IDADlsSetJacFn failed with code {}'
+                                 .format(flag))
 
         # Constraints
         constraints_idx  = opts['constraints_idx']
@@ -1159,7 +1728,7 @@ cdef class IDA:
 
         if not constraints_type is None:
             if not constraints_idx is None:
-                constraints_vars = np.zeros(N, float)
+                constraints_vars = np.zeros(N, DTYPE)
                 for idx in range(constraints_idx):
                     constraints_vars[constraints_idx[idx]] = constraints_type[idx]
             else:
@@ -1168,7 +1737,7 @@ cdef class IDA:
                   '  ''constraints_type'' the constraints_idx has to be of the'\
                   ' same length as y (i.e. contains constraints for EVERY '\
                   'component of y).'
-                constraints_vars = np.asarray(constraints_type, float)
+                constraints_vars = np.asarray(constraints_type, DTYPE)
 
             if not self.constraints is NULL:
                 N_VDestroy(self.constraints)
@@ -1198,7 +1767,7 @@ cdef class IDA:
             (opts['exclude_algvar_from_error'] and not alg_vars_idx is None)):
 
             # DAE variables
-            dae_vars = np.ones(N, float)
+            dae_vars = np.ones(N, DTYPE)
 
             if not alg_vars_idx is None:
                 for algvar_idx in opts['algebraic_vars_idx']:
@@ -1274,7 +1843,7 @@ cdef class IDA:
 
         return (flag, t0)
 
-    def reinit_IC(self, double t0, object y0, object yp0):
+    def reinit_IC(self, DTYPE_t t0, object y0, object yp0):
         """
         Re-initialize (only) the initial condition IC without re-setting also
         all the remaining solver options. See also 'init_step()' funtion.
@@ -1307,8 +1876,8 @@ cdef class IDA:
         if self._old_api:
             return (flag, time)
         else:
-            y_retn  = np.empty(np.alen(np_y0), float)
-            yp_retn = np.empty(np.alen(np_y0), float)
+            y_retn  = np.empty(np.alen(np_y0), DTYPE)
+            yp_retn = np.empty(np.alen(np_y0), DTYPE)
             # no init cond computed, the start values are values at t=t0
             y_retn[:] = np_y0[:]
             yp_retn[:] = np_yp0[:]
@@ -1324,16 +1893,16 @@ cdef class IDA:
             return self.validate_flags(soln)
         return soln
 
-    cpdef _reinit_IC(self, double t0, np.ndarray[DTYPE_t, ndim=1] y0,
+    cpdef _reinit_IC(self, DTYPE_t t0, np.ndarray[DTYPE_t, ndim=1] y0,
                      np.ndarray[DTYPE_t, ndim=1] yp0):
         # If not yet initialized, run full initialization
         if self.y0 is NULL:
             self._init_step(t0, y0, yp0)
             return
 
-        cdef long int N
-        N = <long int> np.alen(y0)
-        Np = <long int> np.alen(yp0)
+        cdef INDEX_TYPE_t N
+        N = <INDEX_TYPE_t> np.alen(y0)
+        Np = <INDEX_TYPE_t> np.alen(yp0)
         if N == self.N and Np == N:
             self.y0  = N_VMake_Serial(N, <realtype *>y0.data)
             self.yp0  = N_VMake_Serial(N, <realtype *>yp0.data)
@@ -1390,9 +1959,9 @@ cdef class IDA:
 
         cdef np.ndarray[DTYPE_t, ndim=1] np_tspan, np_y0, np_yp0
 
-        np_tspan = np.asarray(tspan, dtype=float)
-        np_y0    = np.asarray(y0, dtype=float)
-        np_yp0   = np.asarray(yp0, dtype=float)
+        np_tspan = np.asarray(tspan, dtype=DTYPE)
+        np_y0    = np.asarray(y0, dtype=DTYPE)
+        np_yp0   = np.asarray(yp0, dtype=DTYPE)
 
         soln = self._solve(np_tspan, np_y0, np_yp0)
         if self._old_api:
@@ -1409,9 +1978,9 @@ cdef class IDA:
 
         cdef np.ndarray[DTYPE_t, ndim=1] t_retn
         cdef np.ndarray[DTYPE_t, ndim=2] y_retn, yp_retn
-        t_retn  = np.empty([np.alen(tspan), ], float)
-        y_retn  = np.empty([np.alen(tspan), np.alen(y0)], float)
-        yp_retn = np.empty([np.alen(tspan), np.alen(y0)], float)
+        t_retn  = np.empty([np.alen(tspan), ], DTYPE)
+        y_retn  = np.empty([np.alen(tspan), np.alen(y0)], DTYPE)
+        yp_retn = np.empty([np.alen(tspan), np.alen(y0)], DTYPE)
 
         cdef int flag
 
@@ -1461,8 +2030,8 @@ cdef class IDA:
         cdef IDA_ContinuationFunction onroot = self.options['onroot']
         cdef IDA_ContinuationFunction ontstop = self.options['ontstop']
 
-        y_last   = np.empty(np.shape(y0), float)
-        yp_last  = np.empty(np.shape(y0), float)
+        y_last   = np.empty(np.shape(y0), DTYPE)
+        yp_last  = np.empty(np.shape(y0), DTYPE)
 
 
         t = tspan[idx]
@@ -1626,14 +2195,14 @@ cdef class IDA:
             nv_s2ndarray(y, y_retn)
             y_out = y_retn
         else:
-            y_out  = np.empty(self.N, float)
+            y_out  = np.empty(self.N, DTYPE)
             nv_s2ndarray(y, y_out)
 
         if not yp_retn is None:
             nv_s2ndarray(yp, yp_retn)
             yp_out = yp_retn
         else:
-            yp_out  = np.empty(self.N, float)
+            yp_out  = np.empty(self.N, DTYPE)
             nv_s2ndarray(yp, yp_out)
 
         flag = StatusEnumIDA(flagIDA)
